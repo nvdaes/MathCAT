@@ -389,8 +389,8 @@ impl CanonicalizeContext {
 
 	/// Return an error is some element is not MathML (only look at first child of <semantics>)
 	fn assure_mathml<'a>(&self, mathml: Element<'a>) -> Result<()> {
-		static ALL_MATHML_ELEMENTS: phf::Set<&str> = phf_set!{
-			"mi", "mo", "mn", "mtext", "ms", "mspace", "mglyph",
+		static ALL_MATHML_ELEMENTS: phf::Set<&str> = phf_set!{ // mglyph is removed in trim_element()
+			"mi", "mo", "mn", "mtext", "ms", "mspace",
 			"mfrac", "mroot", "msub", "msup", "msubsup","munder", "mover", "munderover", "mmultiscripts", "mlongdiv",
 			"none", "mprescripts", "malignmark", "maligngroup",
 			"math", "msqrt", "merror", "mpadded", "mphantom", "menclose", "mtd", "mstyle",
@@ -448,7 +448,7 @@ impl CanonicalizeContext {
 		};
 
 		static EMPTY_ELEMENTS: phf::Set<&str> = phf_set! {
-			"mspace", "none", "mprescripts", "mglyph", "malignmark", "maligngroup",
+			"mspace", "none", "mprescripts", "malignmark", "maligngroup",
 		};
 
 		static CURRENCY_SYMBOLS: phf::Set<&str> = phf_set! {
@@ -503,7 +503,7 @@ impl CanonicalizeContext {
 				}
 				return Some(mathml);
 			},
-			"ms" | "mglyph" => {
+			"ms" => {
 				return Some(mathml);
 			},
 			"mi" => {
@@ -1497,7 +1497,7 @@ impl CanonicalizeContext {
 		let tag_name = name(&mathml);
 		set_mathml_name(mathml, tag_name);	// add namespace
 		match tag_name {
-			"mi" | "ms" | "mtext" | "mspace" | "mglyph" => {
+			"mi" | "ms" | "mtext" | "mspace" => {
 				self.canonicalize_plane1(mathml);
 				return Ok( mathml ); },
 			"mo" => {
@@ -3568,6 +3568,37 @@ mod canonicalize_tests {
         assert!(are_strs_canonically_equal(test_str, target_str));
 	}
 
+	#[test]
+    fn clean_mglyph() {
+		// this comes from LateXML
+        let test_str = 	"<math>
+		<mrow>
+		  <mi>
+			<mglyph fontfamily='my-braid-font' index='2' alt='23braid' />
+		  </mi>
+		  <mo>+</mo>
+		  <mi>
+			<mglyph fontfamily='my-braid-font' index='5' alt='132braid' />
+		  </mi>
+		  <mo>=</mo>
+		  <mi>
+			<mglyph fontfamily='my-braid-font' index='3' alt='13braid' />
+		  </mi>
+		</mrow>
+		</math>";
+		let target_str = "<math>
+		<mrow>
+		  <mrow data-changed='added'>
+			<mi>23braid</mi>
+			<mo>+</mo>
+			<mi>132braid</mi>
+		  </mrow>
+		  <mo>=</mo>
+		  <mi>13braid</mi>
+		</mrow>
+	   </math>";
+        assert!(are_strs_canonically_equal(test_str, target_str));
+	}
 
 	#[test]
     fn clean_semantics() {

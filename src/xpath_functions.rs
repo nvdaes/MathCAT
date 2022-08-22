@@ -324,7 +324,7 @@ impl IsNode {
     }
 }
 
-const MATHML_LEAF_NODES: &[&str] = &["mi", "mo", "mn", "mtext", "ms", "mspace", "mglyph"];
+const MATHML_LEAF_NODES: &[&str] = &["mi", "mo", "mn", "mtext", "ms", "mspace"];
 
 // Should mstack and mlongdiv be included here?
 // Hmm... tried using phf::Set, but rust complained about lifetime mismatch when I did MATHML_2D_NODES.contains(str)

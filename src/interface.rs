@@ -470,7 +470,8 @@ pub fn trim_element(e: &Element) {
     }
 
     fn make_leaf_element(mathml_leaf: Element) {
-        // MathML leaves like <mn> really shouldn't have non-textual content, but you could have embedded HTML
+        // MathML leaves like <mn> really shouldn't have non-textual content except for mglyph,
+        //   but you could have embedded HTML
         // Here, we take convert them to leaves by grabbing up all the text and making that the content
         // Potentially, we leave them and let (default) rules do something, but it makes other parts of the code
         //   messier because checking the text of a leaf becomes Option<&str> rather than just &str
@@ -484,10 +485,14 @@ pub fn trim_element(e: &Element) {
         for child in children {
             match child {
                 ChildOfElement::Element(e) => {
-                    make_leaf_element(e);
-                    match e.children()[0] {
-                        ChildOfElement::Text(t) => text += t.text(),
-                        _ => panic!("as_text: internal error -- make_leaf_element found non-text child"),
+                    if name(&e) == "mglyph" {
+                        text += &format!(" {} ", e.attribute_value("alt").unwrap_or(""));
+                    } else {
+                        make_leaf_element(e);
+                        match e.children()[0] {
+                            ChildOfElement::Text(t) => text += t.text(),
+                            _ => panic!("as_text: internal error -- make_leaf_element found non-text child"),
+                        }
                     }
                 }
                 ChildOfElement::Text(t) => text += t.text(),
