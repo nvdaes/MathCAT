@@ -433,6 +433,8 @@ lazy_static! {
 	// two cases because we don't want to have a match for 'Cl', etc.
 	static ref UPPER_ROMAN_NUMERAL: Regex = Regex::new(r"^\s*^M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})\s*$").unwrap();
 	static ref LOWER_ROMAN_NUMERAL: Regex = Regex::new(r"^\s*^m{0,3}(cm|cd|d?c{0,3})(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})\s*$").unwrap();
+	
+	static ref IS_PRIME: Regex = Regex::new(r"['′″‴⁗]").unwrap(); 
 }
 
 
@@ -608,10 +610,6 @@ impl CanonicalizeContext {
 	/// Returns 'None' if the element should not be in the tree.
 	fn clean_mathml<'a>(&self, mathml: Element<'a>) -> Option<Element<'a>> {
 		// Note: this works bottom-up (clean the children first, then this element)
-		lazy_static! {
-			static ref IS_PRIME: Regex = Regex::new(r"['′″‴⁗]").unwrap(); 
-        }
-
 		static CURRENCY_SYMBOLS: phf::Set<&str> = phf_set! {
 			"$", "¢", "€", "£", "₡", "₤", "₨", "₩", "₪", "₱", "₹", "₺", "₿" // could add more currencies...
 		};
@@ -2580,10 +2578,22 @@ impl CanonicalizeContext {
 		let base_of_name = get_possible_embellished_node(node);
 	
 		// actually only 'mi' should be legal here, but some systems used 'mtext' for multi-char variables
-		// FIX: need to allow for composition of function names. E.g, (f+g)(x) and (f^2/g)'(x)
 		let node_name = name(&base_of_name);
 		if node_name != "mi" && node_name != "mtext" {
-			return FunctionNameCertainty::False;
+			debug!("is_function_name: base_of_name\n{}", mml_to_string(&base_of_name));
+			if node_name == "mrow" {
+				let is_composite_function = self.is_composite_function_name(base_of_name, right_siblings);
+				// bump "maybe" to "true" if superscript is a prime (i.e., derivative)
+				if is_composite_function == FunctionNameCertainty::Maybe && name(&node) == "msup" {
+					let superscript = as_element(node.children()[1]);
+					if name(&superscript) == "mo" && IS_PRIME.is_match(as_text(superscript)) {
+						return FunctionNameCertainty::True;
+					}
+				}
+				return is_composite_function;
+			} else {
+				return FunctionNameCertainty::False;
+			}
 		}
 		// whitespace is sometimes added to the mi since braille needs it, so do a trim here to get function name
 		let base_name = as_text(base_of_name).trim();
@@ -2746,6 +2756,94 @@ impl CanonicalizeContext {
 			return (open == "(" && text == ")") || (open == "[" && text == "]");
 		}
 	}
+
+	/// Returns true if 'head' looks like it is a composite function
+	/// We are pretty conservative:
+	///   head must have parens or brackets around it
+	///   all the mi/mtext inside must be function-like names or there must be a compose infix mo at the top level
+	///   only mfrac and adorned non-leaf nodes are allowed
+	///   what follows must be parens or brackets (as best we can tell given that it unparsed)
+	fn is_composite_function_name<'a>(&self, head: Element<'a>, right_siblings: Option<&[ChildOfElement<'a>]>) -> FunctionNameCertainty {
+		if !(IsBracketed::is_bracketed(&head, "(", ")", false, false) ||
+			 IsBracketed::is_bracketed(&head, "[", "]", false, false) ) {
+			return FunctionNameCertainty::False;
+		}
+		
+		let contents = as_element(head.children()[1]);	// already canonicalized
+		if is_special_case_function_compose(contents) {
+			return FunctionNameCertainty::True;
+		}
+		// reuse the code for is_function_name() to pick up whether what follows are parens/brackets (it's complicated since it is unparsed)
+		// we create a "likely" function name
+		// we need to create a mrow parent since there is an assert to make sure 'f' is in an mrow
+		let mrow = create_mathml_element(&contents.document(), "mrow");
+		let function_name = create_mathml_element(&contents.document(), "mi");
+		function_name.set_text("f");
+		mrow.append_child(function_name);
+		let is_right_side_ok = self.is_function_name(function_name, right_siblings);
+		if is_right_side_ok == FunctionNameCertainty::False {
+			return FunctionNameCertainty::False;
+		}
+
+		let is_head_ok = CanonicalizeContext::all_children_are_function_names(contents);
+		return match (is_head_ok, is_right_side_ok) {
+			(FunctionNameCertainty::False, _) => FunctionNameCertainty::False,
+			(FunctionNameCertainty::True, FunctionNameCertainty::True) => FunctionNameCertainty::True,
+			_ => FunctionNameCertainty::Maybe, 		// all that is left is a mixture of true/maybe
+		};
+
+		fn is_special_case_function_compose<'a>(head: Element<'a>) -> bool {
+			// this certainly can use more checking to eliminate silly stuff, but this should be right for normal things
+			debug!("is_special_case_function_compose: {}", mml_to_string(&head));
+			if name(&head) == "mrow" && head.children().len() == 3 {
+				let op = as_element(head.children()[1]);
+				return name(&op) == "mo" && as_text(op) == "∘";		// \u{2218} -- compose/ring operator
+			}
+			return false;
+		}
+	}
+
+	fn all_children_are_function_names(mathml: Element) -> FunctionNameCertainty {
+		let element_name = name(&mathml);
+		if element_name == "mi" || element_name == "mtext" {
+			return crate::definitions::DEFINITIONS.with(|defs| {
+				// names that are always function names (e.g, "sin" and "log")
+				let text = as_text(mathml);
+				let defs = defs.borrow();
+				let names = defs.get_hashset("FunctionNames").unwrap();
+				// UEB seems to think "Sin" (etc) is used for "sin", so we move to lower case
+				if names.contains(&text.to_ascii_lowercase()) {
+					// debug!("     ...is in FunctionNames");
+					return FunctionNameCertainty::True;	// always treated as function names
+				}
+				let likely_names = defs.get_hashset("LikelyFunctionNames").unwrap();
+				if likely_names.contains(text) {
+					return FunctionNameCertainty::True;
+				}
+				return FunctionNameCertainty::False;
+			});
+		} else if is_adorned_node(&mathml) {
+			return CanonicalizeContext::all_children_are_function_names(get_possible_embellished_node(mathml));
+		} else if element_name == "mrow" || element_name == "mfrac" {
+			let mut function_name_certainty = FunctionNameCertainty::True;
+			for child in mathml.children() {
+				let child = as_element(child);
+				if name(&child) != "mo" {
+					let child_certainty = CanonicalizeContext::all_children_are_function_names(child);
+					debug!("--all_children_are_function_names: certainty: {:?}, child\n{}", child_certainty, mml_to_string(&child));
+					if child_certainty == FunctionNameCertainty::False {
+						return FunctionNameCertainty::False;
+					}
+					if child_certainty == FunctionNameCertainty::Maybe {
+						function_name_certainty = FunctionNameCertainty::Maybe;
+					}
+				}
+			}
+			return function_name_certainty;
+		} else {
+			return FunctionNameCertainty::False;
+		}
+	}
 	
 	fn is_mixed_fraction<'a>(&self, integer_part: &'a Element<'a>, fraction_children: &[ChildOfElement<'a>]) -> Result<bool> {
 		// do some simple disqualifying checks on the fraction part
@@ -2840,7 +2938,7 @@ impl CanonicalizeContext {
 			return false;
 		}
 
-		assert_eq!(name(&mrow), "mrow");
+		assert_eq!(name(mrow), "mrow");
 		let container = mrow.parent().unwrap().element().unwrap();
 		let name = name(&container);
 
@@ -3828,9 +3926,138 @@ mod canonicalize_tests {
 		</mrow>
 	   </math>";
         assert!(are_strs_canonically_equal(test_str, target_str));
-
 	}
 
+
+    #[test]
+    fn composite_with_derivative() {
+        let test_str = "<math display='block'>
+		<mrow>
+			<mrow><mo>(</mo><mi>g</mi><mo>+</mo><mi>h</mi><mo>)</mo></mrow>
+			<mo>(</mo><mi>x</mi><mo>)</mo>
+		</mrow> </math>";
+        let target_str = "<math display='block'>
+		<mrow>
+			<mrow>
+			  <mo>(</mo>
+			  <mrow data-changed='added'>
+				<mi>g</mi>
+				<mo>+</mo>
+				<mi>h</mi>
+			  </mrow>
+			  <mo>)</mo>
+			</mrow>
+		  <mo data-changed='added'>&#x2061;</mo>
+		  <mrow data-changed='added'>
+			<mo>(</mo>
+			<mi>x</mi>
+			<mo>)</mo>
+		  </mrow>
+		</mrow>
+	   </math>";
+        assert!(are_strs_canonically_equal(test_str, target_str));
+	}
+
+    #[test]
+    fn not_composite_function() {
+        let test_str = "<math display='block'>
+		<mrow>
+			<mrow><mo>(</mo><mi>f</mi><mo>+</mo><mn>1</mn><mo>)</mo></mrow>
+			<mo>(</mo><mi>x</mi><mo>)</mo>
+		</mrow> </math>";
+        let target_str = "<math display='block'>
+		<mrow>
+			<mrow>
+			  <mo>(</mo>
+			  <mrow data-changed='added'>
+				<mi>f</mi>
+				<mo>+</mo>
+				<mn>1</mn>
+			  </mrow>
+			  <mo>)</mo>
+			</mrow>
+		  <mo data-changed='added'>&#x2062;</mo>
+		  <mrow data-changed='added'>
+			<mo>(</mo>
+			<mi>x</mi>
+			<mo>)</mo>
+		  </mrow>
+		</mrow>
+	   </math>";
+        assert!(are_strs_canonically_equal(test_str, target_str));
+	}
+
+
+    #[test]
+    fn composite_differential_operator() {
+        let test_str = "<math>
+			<mrow>
+				<mo>(</mo>
+				<msub><mi>D</mi><mn>1</mn></msub>
+				<mo>∘ <!-- &#x2218; --></mo>
+				<msub><mi>D</mi><mn>2</mn></msub>
+				<mo>)</mo>
+				<mo>(</mo><mi>f</mi><mo>)</mo>
+				<mo>=</mo>
+				<msub><mi>D</mi><mn>1</mn></msub>
+				<mo>(</mo>
+				<msub><mi>D</mi><mn>2</mn></msub>
+				<mo>(</mo><mi>f</mi><mo>)</mo>
+				<mo>)</mo>
+			</mrow> </math>";
+		let target_str = "<math>
+		<mrow>
+		  <mrow data-changed='added'>
+			<mrow data-changed='added'>
+			  <mo>(</mo>
+			  <mrow data-changed='added'>
+				<msub>
+				  <mi>D</mi>
+				  <mn>1</mn>
+				</msub>
+				<mo>∘</mo>
+				<msub>
+				  <mi>D</mi>
+				  <mn>2</mn>
+				</msub>
+			  </mrow>
+			  <mo>)</mo>
+			</mrow>
+			<mo data-changed='added'>&#x2061;</mo>
+			<mrow data-changed='added'>
+			  <mo>(</mo>
+			  <mi>f</mi>
+			  <mo>)</mo>
+			</mrow>
+		  </mrow>
+		  <mo>=</mo>
+		  <mrow data-changed='added'>
+			<msub>
+			  <mi>D</mi>
+			  <mn>1</mn>
+			</msub>
+			<mo data-changed='added' data-function-guess='true'>&#x2062;</mo>
+			<mrow data-changed='added'>
+			  <mo>(</mo>
+			  <mrow data-changed='added'>
+				<msub>
+				  <mi>D</mi>
+				  <mn>2</mn>
+				</msub>
+				<mo data-changed='added'>&#x2061;</mo>
+				<mrow data-changed='added'>
+				  <mo>(</mo>
+				  <mi>f</mi>
+				  <mo>)</mo>
+				</mrow>
+			  </mrow>
+			  <mo>)</mo>
+			</mrow>
+		  </mrow>
+		</mrow>
+	   </math>";
+        assert!(are_strs_canonically_equal(test_str, target_str));
+	}
 
     #[test]
     fn function_call_vs_implied_times() {
